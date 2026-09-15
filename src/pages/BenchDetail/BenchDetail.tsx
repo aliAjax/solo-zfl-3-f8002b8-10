@@ -26,6 +26,7 @@ import {
 } from '@/types';
 import type { TimePeriodType } from '@/types';
 import Rating from '@/components/Rating/Rating';
+import QualityFindings from '@/components/Quality/QualityFindings';
 import { calculateComfortScore, getComfortLevel, getComfortColor } from '@/utils/comfort';
 
 export default function BenchDetail() {
@@ -258,6 +259,8 @@ export default function BenchDetail() {
               </div>
             )}
           </div>
+
+          <QualityFindings bench={bench} />
 
           <div className="paper-texture rounded-xl shadow-paper p-6 fade-in opacity-0 stagger-3">
             <h3 className="font-serif text-sm font-semibold text-deep-brown mb-3">

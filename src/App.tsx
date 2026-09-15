@@ -5,6 +5,7 @@ import MapPage from '@/pages/MapPage/MapPage';
 import RankingPage from '@/pages/RankingPage/RankingPage';
 import BenchDetail from '@/pages/BenchDetail/BenchDetail';
 import AddEditPage from '@/pages/AddEditPage/AddEditPage';
+import QualityPage from '@/pages/QualityPage/QualityPage';
 
 export default function App() {
   return (
@@ -16,6 +17,7 @@ export default function App() {
             <Route path="/" element={<ListPage />} />
             <Route path="/map" element={<MapPage />} />
             <Route path="/ranking" element={<RankingPage />} />
+            <Route path="/quality" element={<QualityPage />} />
             <Route path="/bench/:id" element={<BenchDetail />} />
             <Route path="/add" element={<AddEditPage />} />
             <Route path="/edit/:id" element={<AddEditPage />} />
