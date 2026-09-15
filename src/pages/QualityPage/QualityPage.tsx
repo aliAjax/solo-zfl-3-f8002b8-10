@@ -14,6 +14,8 @@ import {
   RefreshCw,
   ShieldCheck,
   ShieldAlert,
+  History,
+  X,
 } from 'lucide-react';
 import { useBenchStore } from '@/store/useBenchStore';
 import { useQualityStore } from '@/store/useQualityStore';
@@ -44,11 +46,15 @@ export default function QualityPage() {
   const [severityFilter, setSeverityFilter] = useState<SeverityType | 'all'>('all');
   const [onlyHits, setOnlyHits] = useState(true);
   const [toast, setToast] = useState<string | null>(null);
+  /** 已关闭的补算提示时间戳 */
+  const [dismissedCatchupAt, setDismissedCatchupAt] = useState<string | null>(null);
   const toastTimer = useRef<number | null>(null);
 
   useEffect(() => {
     if (!benchStore.initialized) benchStore.initialize();
     quality.initialize();
+    // 打开校验台：按档案修改时间挑出落后部分补算，不整库重跑
+    quality.catchUpIfNeeded();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -104,7 +110,8 @@ export default function QualityPage() {
     if (res.cycle) {
       showToast('存在循环引用，请先解除环路再校验');
     } else {
-      showToast(`已校验全部 ${benchStore.benches.length} 张长椅档案`);
+      setDismissedCatchupAt(null);
+      showToast(`已手动全量校验 ${benchStore.benches.length} 张长椅档案`);
     }
   };
 
@@ -192,15 +199,35 @@ export default function QualityPage() {
         </div>
       )}
 
-      {quality.lastAutoRecompute && !quality.cycle && (
+      {quality.lastAutoRecompute?.kind === 'catchup' &&
+        dismissedCatchupAt !== quality.lastAutoRecompute.at &&
+        !quality.cycle && (
+        <div className="mb-5 flex items-start gap-3 bg-ochre/5 border border-ochre/30 rounded-xl px-4 py-3 text-sm text-deep-brown">
+          <History className="w-4 h-4 flex-shrink-0 mt-0.5 text-ochre" />
+          <div className="flex-1">
+            打开校验台时发现{' '}
+            <span className="font-semibold text-ochre">{quality.lastAutoRecompute.benchCount}</span>{' '}
+            张档案的结果落后于档案修改时间，已只补算这 {quality.lastAutoRecompute.benchCount} 张落后档案（未整库重跑），其余结果保持不变。
+          </div>
+          <button
+            onClick={() => setDismissedCatchupAt(quality.lastAutoRecompute!.at)}
+            className="text-ink-light hover:text-deep-brown flex-shrink-0"
+            title="关闭提示"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {quality.lastAutoRecompute?.kind === 'live' && !quality.cycle && (
         <div className="mb-5 flex items-start gap-3 bg-moss-green/5 border border-moss-green/20 rounded-xl px-4 py-3 text-sm text-deep-brown">
           <RefreshCw className="w-4 h-4 flex-shrink-0 mt-0.5 text-moss-green" />
-          <div>
+          <div className="flex-1">
             {quality.lastAutoRecompute.reason}：已自动重算{' '}
             <span className="font-semibold text-moss-green">
               {quality.lastAutoRecompute.benchCount}
             </span>{' '}
-            张受影响长椅、{quality.lastAutoRecompute.ruleCount} 条相关规则，其余结果保持不变。
+            张受影响长椅、{quality.lastAutoRecompute.ruleCount} 条相关规则，同一长椅的连续改动以最后一次为准，其余结果保持不变。
           </div>
         </div>
       )}

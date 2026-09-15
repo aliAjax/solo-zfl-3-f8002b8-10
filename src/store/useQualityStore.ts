@@ -12,9 +12,11 @@ import {
 } from '@/utils/validation';
 import {
   getDefaultRules,
+  loadBaseline,
   loadMeta,
   loadResults,
   loadRules,
+  saveBaseline,
   saveMeta,
   saveResults,
   saveRules,
@@ -39,6 +41,19 @@ export interface SaveRuleResult {
   cycle: string[] | null;
 }
 
+/** live：本页档案变更即时对账；catchup：打开校验台时补算落后档案 */
+export type RecomputeKind = 'live' | 'catchup';
+
+export interface AutoRecomputeInfo {
+  at: string;
+  /** 本次实际重算的长椅条数（同一长椅连续改动只计一次） */
+  benchCount: number;
+  /** 本次评估到的规则条数 */
+  ruleCount: number;
+  reason: string;
+  kind: RecomputeKind;
+}
+
 interface QualityState {
   rules: QualityRule[];
   results: ValidationResult[];
@@ -46,15 +61,14 @@ interface QualityState {
   initialized: boolean;
   /** 当前规则集中检测到的环路（正常应为 null） */
   cycle: string[] | null;
-  /** 最近一次（自动）重算信息，供界面提示 */
-  lastAutoRecompute: {
-    at: string;
-    benchCount: number;
-    ruleCount: number;
-    reason: string;
-  } | null;
+  /** 最近一次自动重算信息，供界面提示 */
+  lastAutoRecompute: AutoRecomputeInfo | null;
+  /** 档案基线：benchId -> updatedAt，表示结果已覆盖到的档案版本 */
+  baseline: Record<string, string>;
 
   initialize: () => void;
+  /** 打开校验台时调用：按基线挑出落后档案补算，返回补算条数（0 表示无落后） */
+  catchUpIfNeeded: () => number;
   addRule: (input: Omit<SaveRuleInput, 'id'>) => SaveRuleResult;
   updateRule: (id: string, input: Partial<SaveRuleInput>) => SaveRuleResult;
   deleteRule: (id: string) => void;
@@ -66,8 +80,6 @@ interface QualityState {
   runAll: () => { cycle: string[] | null };
   clearResults: () => void;
 }
-
-type QualityStore = QualityState;
 
 function sortedRules(rules: QualityRule[]): QualityRule[] {
   return [...rules].sort((a, b) => a.order - b.order);
@@ -92,29 +104,130 @@ function recomputeMeta(rules: QualityRule[], results: ValidationResult[], benche
   };
 }
 
-export const useQualityStore = create<QualityStore>((set, get) => {
-  const persist = (patch: Partial<QualityStore>) => {
+function buildBaseline(benches: Bench[]): Record<string, string> {
+  return Object.fromEntries(benches.map((b) => [b.id, b.updatedAt]));
+}
+
+/** 与基线比对：removed=基线里有但档案已删；touched=新增或 updatedAt 落后 */
+function diffAgainstBaseline(
+  benches: Bench[],
+  baseline: Record<string, string>
+): { removed: string[]; touched: string[] } {
+  const liveIds = new Set(benches.map((b) => b.id));
+  const removed = Object.keys(baseline).filter((id) => !liveIds.has(id));
+  const touched = benches
+    .filter((b) => baseline[b.id] !== b.updatedAt)
+    .map((b) => b.id);
+  return { removed, touched };
+}
+
+/**
+ * 档案对账（所有档案增删改路径的唯一入口）：
+ * 按基线只重算「新增/修改」的档案，删除的档案清理结果，
+ * 同一批内同一张长椅只算一次；不触碰其它档案的历史结果。
+ * 返回重算的长椅条数。
+ */
+function reconcileBenches(kind: RecomputeKind, reason: string): number {
+  const state = useQualityStore.getState();
+  if (!state.initialized) return 0;
+  const benches = useBenchStore.getState().benches;
+
+  // 从未做过全量校验：不产生结果，也不推进基线（等用户一键校验）
+  if (!state.meta.lastRunAt) return 0;
+
+  const { removed, touched } = diffAgainstBaseline(benches, state.baseline);
+  if (removed.length === 0 && touched.length === 0) return 0;
+
+  let results = state.results;
+  if (removed.length > 0) {
+    results = pruneResults(results, { benchIds: new Set(removed) });
+  }
+
+  let ruleCount = 0;
+  if (touched.length > 0) {
+    const output = evaluateRules(state.rules, benches, { benchIds: touched });
+    if (output.cycle) {
+      useQualityStore.setState({ cycle: output.cycle });
+      saveMeta(state.meta);
+      return 0;
+    }
+    ruleCount = output.evaluatedRuleIds.length;
+    results = mergeResults(results, output.results);
+  }
+
+  // 推进基线：删除的移除，重算的更新到当前 updatedAt
+  const nextBaseline: Record<string, string> = { ...state.baseline };
+  for (const id of removed) delete nextBaseline[id];
+  for (const b of benches) {
+    if (touched.includes(b.id)) nextBaseline[b.id] = b.updatedAt;
+  }
+
+  const meta: ValidationMeta = {
+    ...recomputeMeta(state.rules, results, benches),
+    lastRunAt: state.meta.lastRunAt,
+    lastRecomputeCount: touched.length,
+  };
+  const info: AutoRecomputeInfo | null =
+    touched.length > 0
+      ? {
+          at: new Date().toISOString(),
+          benchCount: touched.length,
+          ruleCount,
+          reason,
+          kind,
+        }
+      : state.lastAutoRecompute;
+
+  useQualityStore.setState({
+    results,
+    baseline: nextBaseline,
+    meta,
+    cycle: null,
+    lastAutoRecompute: info,
+  });
+  saveResults(results);
+  saveBaseline(nextBaseline);
+  saveMeta(meta);
+  return touched.length;
+}
+
+/** 防抖句柄：合并一次保存动作引发的连续多次档案写入（如改档案+多条体验） */
+let liveTimer: ReturnType<typeof setTimeout> | null = null;
+const LIVE_DEBOUNCE_MS = 150;
+
+function scheduleLiveReconcile() {
+  if (liveTimer !== null) clearTimeout(liveTimer);
+  liveTimer = setTimeout(() => {
+    liveTimer = null;
+    reconcileBenches('live', '档案数据变更');
+  }, LIVE_DEBOUNCE_MS);
+}
+
+export const useQualityStore = create<QualityState>((set, get) => {
+  const persist = (patch: Partial<QualityState>) => {
     const state = { ...get(), ...patch };
     saveRules(state.rules);
     saveResults(state.results);
     saveMeta(state.meta);
+    saveBaseline(state.baseline);
   };
 
-  /** 在给定范围执行增量校验并合并结果 */
-  const runScoped = (
-    opts: { ruleIds?: string[]; benchIds?: string[]; reason: string },
+  /**
+   * 规则侧增量校验（新增/编辑/复制/启停规则）：
+   * 只重算受影响规则（自身+下游），档案范围为全部；
+   * 不推进档案基线——基线只由档案对账与全量校验负责。
+   */
+  const runScopedRules = (
+    ruleIds: string[],
+    reason: string,
     patchRules?: QualityRule[]
   ) => {
     const state = get();
     const rules = patchRules ?? state.rules;
     const benches = useBenchStore.getState().benches;
-    if (!state.meta.lastRunAt) return; // 从未执行过全量校验，不自动跑
+    if (!state.meta.lastRunAt) return;
 
-    const output = evaluateRules(rules, benches, {
-      ruleIds: opts.ruleIds,
-      benchIds: opts.benchIds,
-    });
-
+    const output = evaluateRules(rules, benches, { ruleIds });
     if (output.cycle) {
       set({ cycle: output.cycle });
       persist({ cycle: output.cycle });
@@ -122,34 +235,32 @@ export const useQualityStore = create<QualityStore>((set, get) => {
     }
 
     const results = mergeResults(state.results, output.results);
-    const meta = recomputeMeta(rules, results, benches);
-    const preserved = state.meta;
-    const nextMeta: ValidationMeta = {
-      ...meta,
-      lastRunAt: preserved.lastRunAt,
-      lastRecomputeCount: opts.benchIds ? opts.benchIds.length : benches.length,
+    const meta: ValidationMeta = {
+      ...recomputeMeta(rules, results, benches),
+      lastRunAt: state.meta.lastRunAt,
+      lastRecomputeCount: benches.length,
     };
     set({
       ...(patchRules ? { rules } : {}),
       results,
-      meta: nextMeta,
+      meta,
       cycle: null,
       lastAutoRecompute: {
         at: new Date().toISOString(),
-        benchCount: opts.benchIds ? opts.benchIds.length : benches.length,
+        benchCount: benches.length,
         ruleCount: output.evaluatedRuleIds.length,
-        reason: opts.reason,
+        reason,
+        kind: 'live',
       },
     });
     persist({
       ...(patchRules ? { rules } : {}),
       results,
-      meta: nextMeta,
+      meta,
       cycle: null,
     });
   };
 
-  /** 保存（新增/编辑）规则前做环路拦截 */
   const checkCycle = (candidate: QualityRule[]): string[] | null => findCycle(candidate);
 
   return {
@@ -165,10 +276,11 @@ export const useQualityStore = create<QualityStore>((set, get) => {
     initialized: false,
     cycle: null,
     lastAutoRecompute: null,
+    baseline: {},
 
     initialize: () => {
       if (get().initialized) return;
-      // 确保长椅数据先就绪，避免加载时把全部档案误判为新增
+      // 确保长椅数据先就绪
       if (!useBenchStore.getState().initialized) {
         useBenchStore.getState().initialize();
       }
@@ -177,7 +289,19 @@ export const useQualityStore = create<QualityStore>((set, get) => {
       const results = loadResults();
       const meta = loadMeta();
       const benches = useBenchStore.getState().benches;
-      prevBenches = benches;
+
+      // 基线迁移：
+      // - 键存在：直接读取（可能落后于档案，交给 catchUp/对账处理，绝不在此采纳当前值掩盖差异）
+      // - 键缺失且从未全量校验：采纳当前档案为基线（空基线）
+      // - 键缺失但有旧版历史结果：无法得知旧时间戳，基线置空，
+      //   打开校验台时一次性补算全部档案（仅此一次，之后基线持续维护）
+      const hasBaselineKey = localStorage.getItem('bench-quality-bench-baseline') !== null;
+      const baseline = hasBaselineKey
+        ? loadBaseline()
+        : meta.lastRunAt
+          ? {}
+          : buildBaseline(benches);
+
       const cycle = findCycle(rules);
       set({
         rules: sortedRules(rules),
@@ -189,11 +313,22 @@ export const useQualityStore = create<QualityStore>((set, get) => {
           lastRecomputeCount: meta.lastRecomputeCount,
         },
         cycle,
+        baseline,
         initialized: true,
       });
       saveRules(sortedRules(rules));
       saveResults(results);
       saveMeta(meta);
+      saveBaseline(baseline);
+    },
+
+    catchUpIfNeeded: () => {
+      // 立刻执行，取消防抖中的即时对账，避免同一批改动重复计数
+      if (liveTimer !== null) {
+        clearTimeout(liveTimer);
+        liveTimer = null;
+      }
+      return reconcileBenches('catchup', '打开校验台补算落后档案');
     },
 
     addRule: (input) => {
@@ -222,7 +357,7 @@ export const useQualityStore = create<QualityStore>((set, get) => {
       set({ rules: next, cycle: null });
       persist({ rules: next });
       if (input.enabled) {
-        runScoped({ ruleIds: [rule.id], reason: '新增规则' }, next);
+        runScopedRules([rule.id], '新增规则', next);
       }
       return { ok: true, cycle: null };
     },
@@ -266,10 +401,10 @@ export const useQualityStore = create<QualityStore>((set, get) => {
           [id]
         );
         // 停用的规则不参与重算，但结果保留并标记
-        runScoped(
-          { ruleIds: updated.enabled ? affected : affected.filter((rid) => rid !== id), reason: '规则定义变更' },
-          sortedRules(next)
-        );
+        const scope = updated.enabled ? affected : affected.filter((rid) => rid !== id);
+        if (scope.length > 0) {
+          runScopedRules(scope, '规则定义变更', sortedRules(next));
+        }
       }
       return { ok: true, cycle: null };
     },
@@ -290,7 +425,7 @@ export const useQualityStore = create<QualityStore>((set, get) => {
       set({ rules: sortedRules(remaining), results });
       persist({ rules: sortedRules(remaining), results });
       if (affected.length > 0) {
-        runScoped({ ruleIds: affected, reason: '删除被引用规则' }, sortedRules(remaining));
+        runScopedRules(affected, '删除被引用规则', sortedRules(remaining));
       }
     },
 
@@ -313,7 +448,7 @@ export const useQualityStore = create<QualityStore>((set, get) => {
       set({ rules: next });
       persist({ rules: next });
       if (copy.enabled) {
-        runScoped({ ruleIds: [copy.id], reason: '复制规则' }, next);
+        runScopedRules([copy.id], '复制规则', next);
       }
     },
 
@@ -376,13 +511,17 @@ export const useQualityStore = create<QualityStore>((set, get) => {
         state.rules
       );
       const merged = [...disabledResults, ...output.results];
+      const baseline = buildBaseline(benches);
       const meta: ValidationMeta = {
         ...recomputeMeta(state.rules, merged, benches),
         lastRunAt: new Date().toISOString(),
         lastRecomputeCount: benches.length,
       };
-      set({ results: merged, meta, cycle: null, lastAutoRecompute: null });
-      persist({ results: merged, meta, cycle: null });
+      // 全量校验后没有“待补算”内容，清掉自动重算提示
+      set({ results: merged, meta, cycle: null, baseline, lastAutoRecompute: null });
+      saveResults(merged);
+      saveMeta(meta);
+      saveBaseline(baseline);
       return { cycle: null };
     },
 
@@ -395,85 +534,31 @@ export const useQualityStore = create<QualityStore>((set, get) => {
         hitCount: 0,
         lastRecomputeCount: 0,
       };
-      set({ results: [], meta, lastAutoRecompute: null });
-      persist({ results: [], meta });
+      set({ results: [], meta, lastAutoRecompute: null, baseline: {} });
+      saveResults([]);
+      saveMeta(meta);
+      saveBaseline({});
     },
   };
 });
 
 /**
- * 订阅长椅档案变化（基于 zustand 的状态引用，每次变更都会产生新数组/对象）：
- * 档案增改（含分时段体验增改）→ 只重算受影响长椅；
- * 删除 → 清理对应结果；
- * 从未执行过全量校验时不自动跑。
+ * 订阅长椅档案变化（任意页面写入都会触发）：
+ * 质量 store 可能尚未初始化（用户没进过校验台），先静默初始化
+ * 载入规则/结果/基线，本身不做任何补算；随后用防抖合并
+ * 短时间内的连续写入（编辑页保存时 updateBench + 多条 addExperience），
+ * 同一张长椅以最后一次写入的 updatedAt 为准，只重算一次。
  */
-let prevBenches: Bench[] | null = null;
-
-useBenchStore.subscribe((state) => {
-  const quality = useQualityStore.getState();
-  if (!quality.initialized) {
-    prevBenches = state.benches;
-    return;
+let initializing = false;
+useBenchStore.subscribe(() => {
+  if (initializing) return;
+  if (!useQualityStore.getState().initialized) {
+    initializing = true;
+    try {
+      useQualityStore.getState().initialize();
+    } finally {
+      initializing = false;
+    }
   }
-  const previous = prevBenches;
-  prevBenches = state.benches;
-  if (previous === state.benches || previous === null) return;
-  if (!quality.meta.lastRunAt) return;
-
-  const prevMap = new Map(previous.map((b) => [b.id, b]));
-  const nextMap = new Map(state.benches.map((b) => [b.id, b]));
-
-  const removed = [...prevMap.keys()].filter((id) => !nextMap.has(id));
-  const added = [...nextMap.keys()].filter((id) => !prevMap.has(id));
-  const changed = [...nextMap.keys()].filter((id) => {
-    const p = prevMap.get(id);
-    const n = nextMap.get(id);
-    return p && n && p !== n;
-  });
-
-  if (removed.length === 0 && added.length === 0 && changed.length === 0) return;
-
-  if (removed.length > 0) {
-    const pruned = pruneResults(quality.results, { benchIds: new Set(removed) });
-    useQualityStore.setState({ results: pruned });
-    saveResults(pruned);
-  }
-
-  const affectedIds = [...added, ...changed];
-  if (affectedIds.length === 0) {
-    // 仅删除：刷新统计
-    const meta = {
-      ...quality.meta,
-      ...recomputeMeta(quality.rules, useQualityStore.getState().results, state.benches),
-      lastRunAt: quality.meta.lastRunAt,
-    };
-    useQualityStore.setState({ meta });
-    saveMeta(meta);
-    return;
-  }
-
-  const output = evaluateRules(quality.rules, state.benches, { benchIds: affectedIds });
-  if (output.cycle) {
-    useQualityStore.setState({ cycle: output.cycle });
-    return;
-  }
-  const results = mergeResults(useQualityStore.getState().results, output.results);
-  const meta: ValidationMeta = {
-    ...recomputeMeta(quality.rules, results, state.benches),
-    lastRunAt: quality.meta.lastRunAt,
-    lastRecomputeCount: affectedIds.length,
-  };
-  useQualityStore.setState({
-    results,
-    meta,
-    cycle: null,
-    lastAutoRecompute: {
-      at: new Date().toISOString(),
-      benchCount: affectedIds.length,
-      ruleCount: output.evaluatedRuleIds.length,
-      reason: '档案数据变更',
-    },
-  });
-  saveResults(results);
-  saveMeta(meta);
+  scheduleLiveReconcile();
 });

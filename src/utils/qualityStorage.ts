@@ -3,6 +3,8 @@ import type { QualityRule, ValidationMeta, ValidationResult } from '@/types/qual
 const RULES_KEY = 'bench-quality-rules';
 const RESULTS_KEY = 'bench-quality-results';
 const META_KEY = 'bench-quality-meta';
+/** 档案基线：benchId -> updatedAt，记录结果覆盖到的档案版本 */
+const BASELINE_KEY = 'bench-quality-bench-baseline';
 
 /** 默认示例规则（固定 id，便于互相引用） */
 export function getDefaultRules(): QualityRule[] {
@@ -133,5 +135,24 @@ export function saveMeta(meta: ValidationMeta): void {
     localStorage.setItem(META_KEY, JSON.stringify(meta));
   } catch (error) {
     console.error('Failed to save quality meta:', error);
+  }
+}
+
+/** 档案基线快照（随结果一起持久化，跨标签页关闭期可比对面版本） */
+export function loadBaseline(): Record<string, string> {
+  try {
+    const data = localStorage.getItem(BASELINE_KEY);
+    if (data) return JSON.parse(data) as Record<string, string>;
+  } catch (error) {
+    console.error('Failed to load bench baseline:', error);
+  }
+  return {};
+}
+
+export function saveBaseline(baseline: Record<string, string>): void {
+  try {
+    localStorage.setItem(BASELINE_KEY, JSON.stringify(baseline));
+  } catch (error) {
+    console.error('Failed to save bench baseline:', error);
   }
 }

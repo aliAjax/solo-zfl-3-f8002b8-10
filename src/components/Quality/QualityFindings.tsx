@@ -11,6 +11,9 @@ export default function QualityFindings({ bench }: { bench: Bench }) {
 
   useEffect(() => {
     if (!initialized) initialize();
+    // 每次进入详情都 flush 一次：若刚从编辑页返回有待处理的合并重算，
+    // 立即按基线补算；已同步时仅做一次零成本比对。
+    useQualityStore.getState().catchUpIfNeeded();
   }, [initialized, initialize]);
 
   const ruleById = useMemo(() => new Map(rules.map((r) => [r.id, r])), [rules]);
